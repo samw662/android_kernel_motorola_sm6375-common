@@ -95,3 +95,6 @@ SCHED_FEAT(UTIL_EST, true)
  */
 SCHED_FEAT(SUGOV_RT_MAX_FREQ, false)
 SCHED_FEAT(UTIL_EST_FASTUP, true)
+
+/* Retain eligible current until its protected request/quantum ends. */
+SCHED_FEAT(RUN_TO_PARITY, true)

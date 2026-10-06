@@ -827,13 +827,59 @@ static inline bool deadline_before(u64 a, u64 b)
 	return (s64)(a - b) < 0;
 }
 
+static bool protect_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	return cfs_rq->protected_entity == se &&
+	       deadline_before(se->vruntime, cfs_rq->vprot);
+}
+
+static void cancel_protect_slice(struct cfs_rq *cfs_rq,
+				 struct sched_entity *se)
+{
+	if (cfs_rq->protected_entity == se)
+		cfs_rq->vprot = se->vruntime;
+}
+
+static void forget_protect_slice(struct cfs_rq *cfs_rq,
+				 struct sched_entity *se)
+{
+	if (cfs_rq->protected_entity == se) {
+		cfs_rq->protected_entity = NULL;
+		cfs_rq->vprot = 0;
+	}
+}
+
+/*
+ * The simple picker and the core's class walk have already put prev into
+ * the timeline. Recover the executing entity without changing curr or
+ * accounting it again: with curr == NULL its contribution is in the tree.
+ */
+static struct sched_entity *running_entity(struct cfs_rq *cfs_rq)
+{
+	struct task_struct *p = rq_of(cfs_rq)->curr;
+	struct sched_entity *se;
+
+	if (cfs_rq->curr)
+		return cfs_rq->curr;
+	if (p->sched_class != &fair_sched_class)
+		return NULL;
+
+	se = &p->se;
+	for_each_sched_entity(se) {
+		if (cfs_rq_of(se) == cfs_rq)
+			return se;
+	}
+	return NULL;
+}
+
 /*
  * The timeline is ordered by vruntime. Walk its eligibility boundary,
  * retaining the best node and the fully eligible left subtree with the
  * earliest min_deadline. Then descend that subtree to its minimum. Both
  * walks follow a single tree path, giving O(log n) search.
  *
- * @best is the eligible current entity, which is outside the timeline.
+ * @best is the eligible executing entity, possibly already in the timeline
+ * after put_prev. It seeds the deadline comparison, not the weighted sums.
  * The rq lock must be held and the timeline's augmented data up to date.
  */
 static struct sched_entity *
@@ -901,10 +947,14 @@ pick_eevdf_tree(struct cfs_rq *cfs_rq, struct sched_entity *best)
 /* Account curr before selection; an ineligible leftmost task is no fallback. */
 static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 {
-	struct sched_entity *curr = cfs_rq->curr;
+	struct sched_entity *curr = running_entity(cfs_rq);
 
 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
 		curr = NULL;
+
+	/* Protection never makes an ineligible entity a scheduling candidate. */
+	if (curr && protect_slice(cfs_rq, curr))
+		return curr;
 
 	return pick_eevdf_tree(cfs_rq, curr);
 }
@@ -958,6 +1008,43 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 	return delta;
 }
 
+static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
+
+static void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	u64 slice = se->slice;
+
+	/* Uniform 750us requests need neither min_slice nor variable slices. */
+	if (!sched_feat(RUN_TO_PARITY))
+		slice = min_t(u64, slice, SCHED_BASE_SLICE);
+	cfs_rq->protected_entity = se;
+	/* Preserved relative deadlines may exceed one physical request. */
+	cfs_rq->vprot = min_vruntime(se->deadline,
+			se->vruntime + calc_delta_fair(slice, se));
+}
+
+static void update_protect_slice(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+	u64 vruntime, vprot;
+
+	if (!sched_feat(RUN_TO_PARITY) || !curr || !curr->on_rq ||
+	    cfs_rq->protected_entity != curr)
+		return;
+
+	/* A join can move V backwards, including a BATCH/IDLE wakeup. */
+	vruntime = min_vruntime(curr->vruntime, avg_vruntime(cfs_rq));
+	vprot = min_vruntime(cfs_rq->vprot,
+			vruntime + calc_delta_fair(SCHED_BASE_SLICE, curr));
+	if (vprot == cfs_rq->vprot)
+		return;
+	cfs_rq->vprot = vprot;
+	if (cfs_rq->nr_running > 1 && !protect_slice(cfs_rq, curr)) {
+		resched_curr(rq_of(cfs_rq));
+		clear_buddies(cfs_rq, curr);
+	}
+}
+
 /*
  * Convert the physical request into weighted virtual time. The caller must
  * first place vruntime in the target cfs_rq's absolute virtual-time domain.
@@ -998,27 +1085,29 @@ static bool renew_entity_request(struct sched_entity *se)
 	return true;
 }
 
-static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
-
-/* Renew after accounting; competing entities need a new selection opportunity. */
+/* Request or protection expiry gives competitors a selection opportunity. */
 static bool update_curr_request(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
+	bool renewed;
 
 	if (!curr || !curr->on_rq)
 		return false;
 
-	if (!renew_entity_request(curr))
-		return false;
+	renewed = renew_entity_request(curr);
+	if (renewed) {
+		/* Renewing a request does not renew this execution's protection. */
+		cancel_protect_slice(cfs_rq, curr);
+		/* Single-entity execution and rapid yield also pull the origin. */
+		update_zero_vruntime(cfs_rq);
+	}
 
-	/* Single-entity execution and rapid yield must also pull the origin. */
-	update_zero_vruntime(cfs_rq);
-
-	if (cfs_rq->nr_running > 1) {
+	if (cfs_rq->nr_running > 1 &&
+	    (renewed || !protect_slice(cfs_rq, curr))) {
 		resched_curr(rq_of(cfs_rq));
 		clear_buddies(cfs_rq, curr);
 	}
-	return true;
+	return renewed;
 }
 
 /*
@@ -3304,6 +3393,7 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 	u64 avruntime = 0;
 	s64 remainder = 0, total = 0;
 	unsigned long old_weight = se->load.weight;
+	s64 protection = 0;
 
 	if (active) {
 		/* V must include all outstanding execution, also for !curr. */
@@ -3311,6 +3401,9 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 		avruntime = __avg_vruntime(cfs_rq, se->on_rq ? NULL : se,
 					  &remainder, &total);
 	}
+	/* SAVE can temporarily make the protected current entity !on_rq. */
+	if (cfs_rq->protected_entity == se)
+		protection = (s64)(cfs_rq->vprot - se->vruntime);
 	if (se->on_rq) {
 		if (!curr && weight != old_weight)
 			__dequeue_entity(cfs_rq, se);
@@ -3355,6 +3448,14 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			se->vruntime = origin - se->vlag;
 			se->deadline = se->vruntime +
 				reweight_virtual_time(remaining, old_weight, weight);
+		}
+		if (cfs_rq->protected_entity == se) {
+			/* Do not revive expired/cancelled protection when v moves. */
+			cfs_rq->vprot = se->vruntime;
+			if (protection > 0)
+				cfs_rq->vprot = min_vruntime(se->deadline,
+					se->vruntime + reweight_virtual_time(protection,
+								 old_weight, weight));
 		}
 	}
 
@@ -4537,6 +4638,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
 	struct sched_entity *curr = cfs_rq->curr;
 	u64 vruntime = avg_vruntime(cfs_rq);
+	u64 old_vruntime = se->vruntime;
 	s64 remaining = (s64)(se->deadline - se->vruntime);
 	s64 load = cfs_rq->avg_load;
 	s64 lag = 0;
@@ -4578,6 +4680,13 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		se->deadline = entity_virtual_deadline(se);
 	} else {
 		se->deadline = se->vruntime + remaining;
+	}
+	if (cfs_rq->protected_entity == se) {
+		if (flags & ENQUEUE_WAKEUP)
+			forget_protect_slice(cfs_rq, se);
+		else
+			/* SAVE|MOVE can still be a same-rq administrative join. */
+			cfs_rq->vprot += se->vruntime - old_vruntime;
 	}
 }
 
@@ -4666,6 +4775,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
 	update_zero_vruntime(cfs_rq);
+	update_protect_slice(cfs_rq);
 
 	/*
 	 * When bandwidth control is enabled, cfs might have been removed
@@ -4763,6 +4873,9 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	if (se != cfs_rq->curr)
 		__dequeue_entity(cfs_rq, se);
 	se->on_rq = 0;
+	/* MOVE also describes same-rq policy changes; SAVE itself is not sleep. */
+	if (!(flags & DEQUEUE_SAVE) || (flags & DEQUEUE_SLEEP))
+		forget_protect_slice(cfs_rq, se);
 	account_entity_dequeue(cfs_rq, se);
 
 	/* return excess runtime on last dequeue */
@@ -4779,6 +4892,9 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	if ((flags & (DEQUEUE_SAVE | DEQUEUE_MOVE)) != DEQUEUE_SAVE)
 		update_min_vruntime(cfs_rq);
 	update_zero_vruntime(cfs_rq);
+	/* Do not shorten another task's quantum around an incomplete SAVE pair. */
+	if (!(flags & DEQUEUE_SAVE))
+		update_protect_slice(cfs_rq);
 }
 
 /*
@@ -4822,8 +4938,11 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 }
 
 static void
-set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, bool first)
 {
+	bool repick = running_entity(cfs_rq) == se &&
+		      cfs_rq->protected_entity == se;
+
 	/* 'current' is not kept within the tree. */
 	if (se->on_rq) {
 		/*
@@ -4838,6 +4957,11 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 	update_stats_curr_start(cfs_rq, se);
 	cfs_rq->curr = se;
+
+	/* Administrative restores and same-task repicks cannot extend a quantum. */
+	if (first && !repick)
+		set_protect_slice(cfs_rq, se);
+	update_protect_slice(cfs_rq);
 
 	/*
 	 * Track our maximum slice length, if the CPU's load is at
@@ -4922,7 +5046,8 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	struct sched_entity *next = cfs_rq->next;
 
 	/* A cache-locality hint may break a deadline tie, never eligibility. */
-	if (sched_feat(NEXT_BUDDY) && next && next->on_rq &&
+	if (!(se == running_entity(cfs_rq) && protect_slice(cfs_rq, se)) &&
+	    sched_feat(NEXT_BUDDY) && next && next->on_rq &&
 	    entity_eligible(cfs_rq, next) && next->deadline == se->deadline)
 		se = next;
 
@@ -5851,7 +5976,7 @@ static void hrtick_cancel_fair(struct rq *rq)
 		hrtimer_try_to_cancel(&rq->hrtick_timer);
 }
 
-static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
+static void hrtick_start_fair(struct rq *rq, struct task_struct *p, bool pick)
 {
 	struct sched_entity *se = &p->se;
 	struct load_weight lw = { .weight = NICE_0_LOAD };
@@ -5860,7 +5985,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 	SCHED_WARN_ON(task_rq(p) != rq);
 
 	if (!p->se.on_rq || rq->cfs.h_nr_running <= 1 ||
-	    (rq->curr == p && test_tsk_need_resched(p))) {
+	    (!pick && rq->curr == p && test_tsk_need_resched(p))) {
 		hrtick_cancel_fair(rq);
 		return;
 	}
@@ -5872,8 +5997,12 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 		/* Only competing entities need a deadline-driven preemption. */
 		if (cfs_rq->nr_running <= 1)
 			continue;
+		/* A shortened quantum can end before the preserved request. */
+		if (protect_slice(cfs_rq, se))
+			remaining = min_t(s64, remaining,
+					  (s64)(cfs_rq->vprot - se->vruntime));
 		if (remaining <= 0) {
-			if (rq->curr == p) {
+			if (!pick && rq->curr == p) {
 				resched_curr(rq);
 				hrtick_cancel_fair(rq);
 			} else {
@@ -5908,11 +6037,11 @@ static void hrtick_update(struct rq *rq)
 		hrtick_cancel_fair(rq);
 		return;
 	}
-	hrtick_start_fair(rq, curr);
+	hrtick_start_fair(rq, curr, false);
 }
 #else /* !CONFIG_SCHED_HRTICK */
 static inline void
-hrtick_start_fair(struct rq *rq, struct task_struct *p)
+hrtick_start_fair(struct rq *rq, struct task_struct *p, bool pick)
 {
 }
 
@@ -8132,6 +8261,20 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		next_buddy_marked = 1;
 	}
 
+	/* Account and shorten protection even for BATCH/IDLE or pending resched. */
+	find_matching_se(&se, &pse);
+	BUG_ON(!pse);
+	cfs_rq = cfs_rq_of(se);
+	update_curr(cfs_rq);
+	update_protect_slice(cfs_rq);
+
+	/* A non-idle wakeup must not leave an idle entity protected in the picker. */
+	if (unlikely(task_has_idle_policy(curr)) &&
+	    likely(!task_has_idle_policy(p)))
+		cancel_protect_slice(cfs_rq, se);
+	/* Enqueue may have armed the timer before the protection update. */
+	hrtick_update(rq);
+
 	/*
 	 * We can come here with TIF_NEED_RESCHED already set from new task
 	 * wake up path.
@@ -8151,17 +8294,15 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		goto preempt;
 
 	/*
-	 * Batch and idle tasks do not preempt non-idle tasks (their preemption
-	 * is driven by the tick):
+	 * BATCH/IDLE do not request deadline-based wakeup preemption. Accounting
+	 * or an exhausted protection interval above can still request a pick.
 	 */
 	if (unlikely(p->policy != SCHED_NORMAL) || !sched_feat(WAKEUP_PREEMPTION))
 		return;
 
-	find_matching_se(&se, &pse);
-	update_curr(cfs_rq_of(se));
-	BUG_ON(!pse);
 	/* Child-runs-first is a hint among equally early eligible requests. */
 	if ((wake_flags & WF_FORK) && sysctl_sched_child_runs_first &&
+	    !protect_slice(cfs_rq, se) &&
 	    entity_eligible(cfs_rq_of(se), pse) &&
 	    pse->deadline == se->deadline) {
 		set_next_buddy(pse);
@@ -8275,13 +8416,13 @@ again:
 				pse = parent_entity(pse);
 			}
 			if (se_depth >= pse_depth) {
-				set_next_entity(cfs_rq_of(se), se);
+				set_next_entity(cfs_rq_of(se), se, true);
 				se = parent_entity(se);
 			}
 		}
 
 		put_prev_entity(cfs_rq, pse);
-		set_next_entity(cfs_rq, se);
+		set_next_entity(cfs_rq, se, true);
 	}
 
 	goto done;
@@ -8292,7 +8433,7 @@ simple:
 
 	do {
 		se = pick_next_entity(cfs_rq, NULL);
-		set_next_entity(cfs_rq, se);
+		set_next_entity(cfs_rq, se, true);
 		cfs_rq = group_cfs_rq(se);
 	} while (cfs_rq);
 
@@ -8308,8 +8449,9 @@ done: __maybe_unused;
 	list_move(&p->se.group_node, &rq->cfs_tasks);
 #endif
 
+	/* Core clears NEED_RESCHED only after this picker returns. */
 	if (hrtick_enabled(rq))
-		hrtick_start_fair(rq, p);
+		hrtick_start_fair(rq, p, true);
 
 	update_misfit_status(p, rq);
 
@@ -8366,6 +8508,8 @@ static void yield_task_fair(struct rq *rq)
 	struct cfs_rq *cfs_rq = task_cfs_rq(curr);
 	struct sched_entity *se = &curr->se;
 	u64 deadline = se->deadline;
+
+	cancel_protect_slice(cfs_rq, se);
 
 	/*
 	 * Are we the only task in the tree?
@@ -12237,13 +12381,21 @@ static void check_preempt_changed_fair(struct rq *rq)
 static void
 prio_changed_fair(struct rq *rq, struct task_struct *p, int oldprio)
 {
+	/* NORMAL/BATCH -> IDLE cannot protect current against non-idle work. */
+	if (rq->curr->sched_class == &fair_sched_class &&
+	    task_has_idle_policy(rq->curr) &&
+	    rq->cfs.h_nr_running > rq->cfs.idle_h_nr_running)
+		cancel_protect_slice(task_cfs_rq(rq->curr), &rq->curr->se);
+
 	if (!task_on_rq_queued(p))
 		return;
 
-	if (rq->curr->sched_class == &fair_sched_class)
+	if (rq->curr->sched_class == &fair_sched_class) {
 		check_preempt_changed_fair(rq);
-	else
+		hrtick_update(rq);
+	} else {
 		check_preempt_curr(rq, p, 0);
+	}
 }
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -12280,6 +12432,9 @@ static void propagate_entity_cfs_rq(struct sched_entity *se) { }
 static void detach_entity_cfs_rq(struct sched_entity *se)
 {
 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+	/* Class exit, rq migration and group moves end this execution quantum. */
+	forget_protect_slice(cfs_rq, se);
 
 	/* Catch up with the cfs_rq and remove our load when we leave */
 	update_load_avg(cfs_rq, se, 0);
@@ -12359,7 +12514,7 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 	for_each_sched_entity(se) {
 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
 
-		set_next_entity(cfs_rq, se);
+		set_next_entity(cfs_rq, se, first);
 		/* ensure bandwidth has been allocated on our new cfs_rq */
 		account_cfs_rq_runtime(cfs_rq, 0);
 	}
@@ -12374,6 +12529,8 @@ void init_cfs_rq(struct cfs_rq *cfs_rq)
 	cfs_rq->avg_load = 0;
 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
 	cfs_rq->zero_vruntime = cfs_rq->min_vruntime;
+	cfs_rq->protected_entity = NULL;
+	cfs_rq->vprot = 0;
 #ifndef CONFIG_64BIT
 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
 #endif

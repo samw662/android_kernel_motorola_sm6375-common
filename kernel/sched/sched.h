@@ -718,6 +718,13 @@ struct cfs_rq {
 	struct list_head	throttled_list;
 #endif /* CONFIG_CFS_BANDWIDTH */
 #endif /* CONFIG_FAIR_GROUP_SCHED */
+	/*
+	 * Protection belongs to the last fair execution opportunity on this rq.
+	 * Keep it through SAVE/RESTORE, but not a real dequeue or class exit.
+	 * Neither sched_entity's KABI layout nor its saved vlag is changed.
+	 */
+	struct sched_entity	*protected_entity;
+	u64			vprot;
 };
 
 static inline int rt_bandwidth_enabled(void)
