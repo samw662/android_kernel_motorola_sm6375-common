@@ -447,6 +447,8 @@ bool early_detection_notify(struct rq *rq, u64 wallclock)
 		return 0;
 
 	list_for_each_entry(p, &rq->cfs_tasks, se.group_node) {
+		if (task_sched_delayed(p))
+			continue;
 		if (!loop_max)
 			break;
 
@@ -999,7 +1001,8 @@ void fixup_busy_time(struct task_struct *p, int new_cpu)
 	 * the task's contribution towards cumulative window
 	 * demand.
 	 */
-	if (pstate == TASK_WAKING && p->wts.last_sleep_ts >=
+	if ((pstate == TASK_WAKING || task_sched_delayed(p)) &&
+	    p->wts.last_sleep_ts >=
 				       src_rq->wrq.window_start) {
 		walt_fixup_cum_window_demand(src_rq,
 					     -(s64)p->wts.demand_scaled);
@@ -1280,7 +1283,8 @@ void update_task_pred_demand(struct rq *rq, struct task_struct *p, int event)
 	 * related groups
 	 */
 	if (event == TASK_UPDATE) {
-		if (!p->on_rq && !SCHED_FREQ_ACCOUNT_WAIT_TIME)
+		if ((!p->on_rq || task_sched_delayed(p)) &&
+		    rq->curr != p && !SCHED_FREQ_ACCOUNT_WAIT_TIME)
 			return;
 	}
 
@@ -1291,7 +1295,7 @@ void update_task_pred_demand(struct rq *rq, struct task_struct *p, int event)
 		return;
 
 	new_scaled = scale_demand(new);
-	if (task_on_rq_queued(p) && (!task_has_dl_policy(p) ||
+	if (task_on_rq_runnable(p) && (!task_has_dl_policy(p) ||
 				!p->dl.dl_throttled))
 		fixup_walt_sched_stats_common(rq, p,
 				p->wts.demand_scaled,
@@ -1498,8 +1502,13 @@ static int account_busy_for_cpu_time(struct rq *rq, struct task_struct *p,
 		if (rq->curr == p)
 			return 1;
 
-		return p->on_rq ? SCHED_FREQ_ACCOUNT_WAIT_TIME : 0;
+		return (p->on_rq && !task_sched_delayed(p)) ?
+			SCHED_FREQ_ACCOUNT_WAIT_TIME : 0;
 	}
+
+	/* A retained sleeper is not waiting for execution. */
+	if (task_sched_delayed(p))
+		return 0;
 
 	/* TASK_MIGRATE, PICK_NEXT_TASK left */
 	return SCHED_FREQ_ACCOUNT_WAIT_TIME;
@@ -1851,9 +1860,12 @@ account_busy_for_task_demand(struct rq *rq, struct task_struct *p, int event)
 		if (rq->curr == p)
 			return 1;
 
-		return p->on_rq ? SCHED_ACCOUNT_WAIT_TIME : 0;
+		return (p->on_rq && !task_sched_delayed(p)) ?
+			SCHED_ACCOUNT_WAIT_TIME : 0;
 	}
 
+	if (task_sched_delayed(p) && event != PUT_PREV_TASK)
+		return 0;
 	return 1;
 }
 
@@ -1925,7 +1937,7 @@ static void update_history(struct rq *rq, struct task_struct *p,
 	 * demand.
 	 */
 	if (!task_has_dl_policy(p) || !p->dl.dl_throttled) {
-		if (task_on_rq_queued(p))
+		if (task_on_rq_runnable(p))
 			fixup_walt_sched_stats_common(rq, p,
 					demand_scaled, pred_demand_scaled);
 		else if (rq->curr == p)

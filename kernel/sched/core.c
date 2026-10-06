@@ -716,6 +716,9 @@ bool sched_can_stop_tick(struct rq *rq)
 	 */
 	if (rq->nr_running > 1)
 		return false;
+	/* One runnable task may still owe service to retained EEVDF members. */
+	if (rq->cfs.nr_running != rq->cfs.h_nr_running)
+		return false;
 
 	return true;
 }
@@ -1409,16 +1412,26 @@ static inline void init_uclamp(void) { }
 
 static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 {
+	bool runnable = !task_sched_delayed(p) || (flags & ENQUEUE_DELAYED);
+
 	if (!(flags & ENQUEUE_NOCLOCK))
 		update_rq_clock(rq);
 
-	if (!(flags & ENQUEUE_RESTORE)) {
+	if (runnable && !(flags & ENQUEUE_RESTORE)) {
 		sched_info_queued(rq, p);
 		psi_enqueue(p, flags & ENQUEUE_WAKEUP);
 	}
+	if (!runnable && task_on_rq_migrating(p))
+		psi_enqueue_delayed(p);
 
-	uclamp_rq_inc(rq, p);
+	if (runnable && !(flags & ENQUEUE_DELAYED))
+		uclamp_rq_inc(rq, p);
 	p->sched_class->enqueue_task(rq, p, flags);
+	if (!runnable)
+		return;
+	/* A delayed wake must first clear the retained-sleeper state. */
+	if (flags & ENQUEUE_DELAYED)
+		uclamp_rq_inc(rq, p);
 	walt_update_last_enqueue(p);
 	trace_sched_enq_deq_task(p, 1, cpumask_bits(&p->cpus_mask)[0]);
 
@@ -1427,16 +1440,23 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 
 static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 {
+	bool runnable = !task_sched_delayed(p);
+
 	if (!(flags & DEQUEUE_NOCLOCK))
 		update_rq_clock(rq);
 
-	if (!(flags & DEQUEUE_SAVE)) {
+	if (runnable && !(flags & DEQUEUE_SAVE)) {
 		sched_info_dequeued(rq, p);
 		psi_dequeue(p, flags & DEQUEUE_SLEEP);
 	}
+	if (!runnable && task_on_rq_migrating(p))
+		psi_dequeue_delayed(p);
 
-	uclamp_rq_dec(rq, p);
+	if (runnable)
+		uclamp_rq_dec(rq, p);
 	p->sched_class->dequeue_task(rq, p, flags);
+	if (!runnable)
+		return;
 #ifdef CONFIG_SCHED_WALT
 	if (p == rq->wrq.ed_task)
 		early_detection_notify(rq, sched_ktime_clock());
@@ -1451,7 +1471,7 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 	if (task_on_rq_migrating(p))
 		flags |= ENQUEUE_MIGRATED;
 
-	if (task_contributes_to_load(p))
+	if (!task_sched_delayed(p) && task_contributes_to_load(p))
 		rq->nr_uninterruptible--;
 
 	enqueue_task(rq, p, flags);
@@ -1461,17 +1481,35 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 
 void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 {
-	p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;
+	bool sleep = flags & DEQUEUE_SLEEP;
+	bool delayed = flags & DEQUEUE_DELAYED;
 
-	if (task_contributes_to_load(p))
+	/* Migration publication precedes all class/vendor dequeue accounting. */
+	if (!sleep)
+		WRITE_ONCE(p->on_rq, TASK_ON_RQ_MIGRATING);
+
+	if (!delayed && !task_sched_delayed(p) && task_contributes_to_load(p))
 		rq->nr_uninterruptible++;
 
 #ifdef CONFIG_SCHED_WALT
-	if (flags & DEQUEUE_SLEEP)
+	if (sleep && !delayed)
 		clear_ed_task(p, rq);
 #endif
 
 	dequeue_task(rq, p, flags);
+	if (sleep && !task_sched_delayed(p)) {
+		/* Last task access: ttwu can proceed without this rq lock now. */
+		WRITE_ONCE(p->on_rq, 0);
+	}
+}
+
+/* rq lock held; the logical block and its demand/PSI accounting already ran. */
+void finish_delayed_task(struct rq *rq, struct task_struct *p)
+{
+	lockdep_assert_held(&rq->lock);
+	SCHED_WARN_ON(!task_sched_delayed(p));
+	deactivate_task(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED | DEQUEUE_NOCLOCK);
+	/* No further access to p: publication above permits a remote wakeup. */
 }
 
 /*
@@ -1556,6 +1594,10 @@ static inline void check_class_changed(struct rq *rq, struct task_struct *p,
 void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
 {
 	const struct sched_class *class;
+
+	/* Retained membership may drain idle, but cannot preempt runnable work. */
+	if (task_sched_delayed(p) && rq->curr != rq->idle)
+		return;
 
 	if (p->sched_class == rq->curr->sched_class) {
 		rq->curr->sched_class->check_preempt_curr(rq, p, flags);
@@ -1912,6 +1954,11 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 	trace_sched_migrate_task(p, new_cpu);
 
 	if (task_cpu(p) != new_cpu) {
+		/* The logical I/O sleep survives administrative delayed migration. */
+		if (task_sched_delayed(p) && p->in_iowait) {
+			atomic_dec(&task_rq(p)->nr_iowait);
+			atomic_inc(&cpu_rq(new_cpu)->nr_iowait);
+		}
 		if (p->sched_class->migrate_task_rq)
 			p->sched_class->migrate_task_rq(p, new_cpu);
 		p->se.nr_migrations++;
@@ -2097,6 +2144,12 @@ unsigned long wait_task_inactive(struct task_struct *p, long match_state)
 		trace_sched_wait_task(p);
 		running = task_running(rq, p);
 		queued = task_on_rq_queued(p);
+		if (!running && queued && task_sched_delayed(p) &&
+		    (!match_state || p->state == match_state)) {
+			update_rq_clock(rq);
+			finish_delayed_task(rq, p);
+			queued = 0;
+		}
 		ncsw = 0;
 		if (!match_state || p->state == match_state)
 			ncsw = p->nvcsw | LONG_MIN; /* sets MSB */
@@ -2481,15 +2534,41 @@ static int ttwu_remote(struct task_struct *p, int wake_flags)
 	struct rq_flags rf;
 	struct rq *rq;
 	int ret = 0;
+	bool delayed_wake = false;
+	unsigned int old_load = 0;
 
 	rq = __task_rq_lock(p, &rf);
 	if (task_on_rq_queued(p)) {
 		/* check_preempt_curr() may use rq clock */
 		update_rq_clock(rq);
+		if (task_sched_delayed(p)) {
+#ifdef CONFIG_SMP
+			/* d68803506ffb: a sleeping task can choose another CPU. */
+			if (!p->on_cpu && rq->nr_running &&
+			    p->nr_cpus_allowed > 1) {
+				finish_delayed_task(rq, p);
+				goto unlock;
+			}
+#endif
+			old_load = walt_ttwu_locked(p, rq);
+			if (task_contributes_to_load(p))
+				rq->nr_uninterruptible--;
+			p->state = TASK_WAKING;
+			if (p->in_iowait) {
+				delayacct_blkio_end(p);
+				atomic_dec(&rq->nr_iowait);
+			}
+			enqueue_task(rq, p, ENQUEUE_WAKEUP | ENQUEUE_DELAYED |
+					   ENQUEUE_NOCLOCK);
+			delayed_wake = true;
+		}
 		ttwu_do_wakeup(rq, p, wake_flags, &rf);
 		ret = 1;
 	}
+unlock:
 	__task_rq_unlock(rq, &rf);
+	if (delayed_wake)
+		walt_ttwu_preferred_cluster(p, old_load);
 
 	return ret;
 }
@@ -2733,6 +2812,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags,
 
 	preempt_disable();
 	if (p == current) {
+		SCHED_WARN_ON(task_sched_delayed(p));
 		/*
 		 * We're waking current, this means 'p->on_rq' and 'task_cpu(p)
 		 * == smp_processor_id()'. Together this means we can special
@@ -2957,6 +3037,7 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
 	p->on_rq			= 0;
+	p->sched_delayed			= 0;
 
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
@@ -4377,7 +4458,12 @@ static void __sched notrace __schedule(bool preempt)
 		if (signal_pending_state(prev->state, prev)) {
 			prev->state = TASK_RUNNING;
 		} else {
-			deactivate_task(rq, prev, DEQUEUE_SLEEP | DEQUEUE_NOCLOCK);
+			int flags = DEQUEUE_SLEEP | DEQUEUE_NOCLOCK;
+
+			if (is_special_task_state(prev->state) ||
+			    (prev->flags & PF_FROZEN))
+				flags |= DEQUEUE_SPECIAL;
+			deactivate_task(rq, prev, flags);
 
 			if (prev->in_iowait) {
 				atomic_inc(&rq->nr_iowait);
@@ -4394,7 +4480,7 @@ static void __sched notrace __schedule(bool preempt)
 	wallclock = sched_ktime_clock();
 	if (likely(prev != next)) {
 #ifdef CONFIG_SCHED_WALT
-		if (!prev->on_rq)
+		if (!prev->on_rq || task_sched_delayed(prev))
 			prev->wts.last_sleep_ts = wallclock;
 #endif
 
@@ -4783,6 +4869,10 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 		queue_flag &= ~DEQUEUE_MOVE;
 
 	prev_class = p->sched_class;
+	/* Finish a blocked fair entity before PI changes its scheduling class. */
+	if (prev_class == &fair_sched_class && task_sched_delayed(p) &&
+	    (dl_prio(prio) || rt_prio(prio)))
+		finish_delayed_task(rq, p);
 	queued = task_on_rq_queued(p);
 	running = task_current(rq, p);
 	if (queued)
@@ -5324,6 +5414,11 @@ change:
 			queue_flags &= ~DEQUEUE_MOVE;
 	}
 
+	/* 1ae5f5dfe5ad: remove retained fair sleepers before leaving the class. */
+	if (p->sched_class == &fair_sched_class && task_sched_delayed(p) &&
+	    (dl_prio(pi ? new_effective_prio : newprio) ||
+	     rt_prio(pi ? new_effective_prio : newprio)))
+		finish_delayed_task(rq, p);
 	queued = task_on_rq_queued(p);
 	running = task_current(rq, p);
 	if (queued)
@@ -6768,6 +6863,7 @@ void migrate_tasks(struct rq *dead_rq, struct rq_flags *rf,
 	 * value of rq->clock[_task]
 	 */
 	update_rq_clock(rq);
+	finish_delayed_tasks(rq);
 
 	for (;;) {
 		/*

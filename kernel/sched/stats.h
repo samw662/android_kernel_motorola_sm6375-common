@@ -100,6 +100,35 @@ static inline void psi_dequeue(struct task_struct *p, bool sleep)
 	psi_task_change(p, clear, set);
 }
 
+/* Administrative migration of an already-blocked retained sleeper. */
+static inline void psi_dequeue_delayed(struct task_struct *p)
+{
+	int clear = 0;
+
+	if (static_branch_likely(&psi_disabled))
+		return;
+	if (p->in_iowait)
+		clear |= TSK_IOWAIT;
+	if (p->flags & PF_MEMSTALL)
+		clear |= TSK_MEMSTALL;
+	if (clear)
+		psi_task_change(p, clear, 0);
+}
+
+static inline void psi_enqueue_delayed(struct task_struct *p)
+{
+	int set = 0;
+
+	if (static_branch_likely(&psi_disabled))
+		return;
+	if (p->in_iowait)
+		set |= TSK_IOWAIT;
+	if (p->flags & PF_MEMSTALL)
+		set |= TSK_MEMSTALL;
+	if (set)
+		psi_task_change(p, 0, set);
+}
+
 static inline void psi_ttwu_dequeue(struct task_struct *p)
 {
 	if (static_branch_likely(&psi_disabled))
@@ -137,6 +166,8 @@ static inline void psi_task_tick(struct rq *rq)
 #else /* CONFIG_PSI */
 static inline void psi_enqueue(struct task_struct *p, bool wakeup) {}
 static inline void psi_dequeue(struct task_struct *p, bool sleep) {}
+static inline void psi_dequeue_delayed(struct task_struct *p) {}
+static inline void psi_enqueue_delayed(struct task_struct *p) {}
 static inline void psi_ttwu_dequeue(struct task_struct *p) {}
 static inline void psi_task_tick(struct rq *rq) {}
 #endif /* CONFIG_PSI */

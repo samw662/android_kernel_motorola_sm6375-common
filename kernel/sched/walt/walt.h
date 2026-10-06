@@ -45,7 +45,8 @@ walt_inc_cumulative_runnable_avg(struct rq *rq, struct task_struct *p)
 	 *     prio/cgroup/class change.
 	 * (2) task is waking for the first time in this window.
 	 */
-	if (p->on_rq || (p->wts.last_sleep_ts < rq->wrq.window_start))
+	if ((p->on_rq && p->state != TASK_WAKING) ||
+	    (p->wts.last_sleep_ts < rq->wrq.window_start))
 		walt_fixup_cum_window_demand(rq, p->wts.demand_scaled);
 }
 
@@ -175,28 +176,42 @@ static inline bool walt_should_kick_upmigrate(struct task_struct *p, int cpu)
 extern bool is_rtgb_active(void);
 extern u64 get_rtgb_active_time(void);
 
-/* utility function to update walt signals at wakeup */
-static inline void walt_try_to_wake_up(struct task_struct *p)
+/* rq lock held; also used by a wakeup of a retained EEVDF sleeper. */
+static inline unsigned int walt_ttwu_locked(struct task_struct *p, struct rq *rq)
 {
-	struct rq *rq = cpu_rq(task_cpu(p));
-	struct rq_flags rf;
-	u64 wallclock;
-	unsigned int old_load;
-	struct walt_related_thread_group *grp = NULL;
+	u64 wallclock = sched_ktime_clock();
+	unsigned int old_load = task_load(p);
 
-	rq_lock_irqsave(rq, &rf);
-	old_load = task_load(p);
-	wallclock = sched_ktime_clock();
+	lockdep_assert_held(&rq->lock);
 	walt_update_task_ravg(rq->curr, rq, TASK_UPDATE, wallclock, 0);
 	walt_update_task_ravg(p, rq, TASK_WAKE, wallclock, 0);
 	note_task_waking(p, wallclock);
-	rq_unlock_irqrestore(rq, &rf);
+	return old_load;
+}
+
+static inline void walt_ttwu_preferred_cluster(struct task_struct *p,
+					      unsigned int old_load)
+{
+	struct walt_related_thread_group *grp;
 
 	rcu_read_lock();
 	grp = task_related_thread_group(p);
 	if (update_preferred_cluster(grp, p, old_load, false))
 		set_preferred_cluster(grp);
 	rcu_read_unlock();
+}
+
+/* utility function to update walt signals at wakeup */
+static inline void walt_try_to_wake_up(struct task_struct *p)
+{
+	struct rq *rq = cpu_rq(task_cpu(p));
+	struct rq_flags rf;
+	unsigned int old_load;
+
+	rq_lock_irqsave(rq, &rf);
+	old_load = walt_ttwu_locked(p, rq);
+	rq_unlock_irqrestore(rq, &rf);
+	walt_ttwu_preferred_cluster(p, old_load);
 }
 
 static inline unsigned int walt_nr_rtg_high_prio(int cpu)
@@ -278,6 +293,12 @@ static inline u64 get_rtgb_active_time(void)
 }
 
 #define walt_try_to_wake_up(a) {}
+static inline unsigned int walt_ttwu_locked(struct task_struct *p, struct rq *rq)
+{
+	return 0;
+}
+static inline void walt_ttwu_preferred_cluster(struct task_struct *p,
+					      unsigned int old_load) { }
 
 #endif /* CONFIG_SCHED_WALT */
 

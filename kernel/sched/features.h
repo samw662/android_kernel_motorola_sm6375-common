@@ -98,3 +98,8 @@ SCHED_FEAT(UTIL_EST_FASTUP, true)
 
 /* Retain eligible current until its protected request/quantum ends. */
 SCHED_FEAT(RUN_TO_PARITY, true)
+
+/* Retain ineligible sleepers until their service debt is amortized. */
+SCHED_FEAT(DELAY_DEQUEUE, true)
+/* Retained sleepers must not acquire positive service credit. */
+SCHED_FEAT(DELAY_ZERO, true)

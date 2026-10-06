@@ -152,6 +152,8 @@ void walt_check_for_rotation(struct rq *src_rq)
 
 	double_rq_lock(src_rq, dst_rq);
 	if (dst_rq->curr->sched_class == &fair_sched_class &&
+		task_on_rq_runnable(src_rq->curr) &&
+		task_on_rq_runnable(dst_rq->curr) &&
 		!src_rq->active_balance && !dst_rq->active_balance) {
 		get_task_struct(src_rq->curr);
 		get_task_struct(dst_rq->curr);
@@ -182,6 +184,9 @@ void check_for_migration(struct rq *rq, struct task_struct *p)
 	int new_cpu = -1;
 	int prev_cpu = task_cpu(p);
 	int ret;
+
+	if (task_sched_delayed(p))
+		return;
 
 	if (rq->misfit_task_load) {
 		if (rq->curr->state != TASK_RUNNING ||

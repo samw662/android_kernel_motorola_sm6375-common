@@ -126,14 +126,14 @@ enum task_boost_type {
 	TASK_BOOST_END,
 };
 
-#ifdef CONFIG_DEBUG_ATOMIC_SLEEP
-
 /*
  * Special states are those that do not use the normal wait-loop pattern. See
  * the comment with set_special_state().
  */
 #define is_special_task_state(state)				\
 	((state) & (__TASK_STOPPED | __TASK_TRACED | TASK_PARKED | TASK_DEAD))
+
+#ifdef CONFIG_DEBUG_ATOMIC_SLEEP
 
 #define __set_current_state(state_value)			\
 	do {							\
@@ -1478,7 +1478,8 @@ struct task_struct {
 
 	ANDROID_VENDOR_DATA_ARRAY(1, 3);
 
-	ANDROID_KABI_RESERVE(1);
+	/* Fair sleeper retained for EEVDF accounting, never executable. */
+	ANDROID_KABI_USE(1, u64 sched_delayed);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
@@ -1511,6 +1512,12 @@ struct task_struct {
 	 * Do not put anything below here!
 	 */
 };
+
+/* A retained fair sleeper is queued for accounting, but cannot execute. */
+static inline bool task_sched_delayed(const struct task_struct *p)
+{
+	return READ_ONCE(p->sched_delayed);
+}
 
 static inline struct pid *task_pid(struct task_struct *task)
 {

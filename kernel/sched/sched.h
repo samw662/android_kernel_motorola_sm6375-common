@@ -619,9 +619,9 @@ struct cfs_bandwidth { };
 struct cfs_rq {
 	struct load_weight	load;
 	unsigned long		runnable_weight;
-	unsigned int		nr_running;
-	unsigned int		h_nr_running;      /* SCHED_{NORMAL,BATCH,IDLE} */
-	unsigned int		idle_h_nr_running; /* SCHED_IDLE */
+	unsigned int		nr_running;        /* EEVDF members, including delayed */
+	unsigned int		h_nr_running;      /* runnable SCHED_{NORMAL,BATCH,IDLE} */
+	unsigned int		idle_h_nr_running; /* runnable SCHED_IDLE */
 
 	/*
 	 * Virtual-time accounting for entities in tasks_timeline only:
@@ -841,6 +841,12 @@ struct dl_rq {
 #else
 #define entity_is_task(se)	1
 #endif
+
+static inline bool entity_sched_delayed(struct sched_entity *se)
+{
+	return entity_is_task(se) &&
+		task_sched_delayed(container_of(se, struct task_struct, se));
+}
 
 #ifdef CONFIG_SMP
 /*
@@ -1807,6 +1813,12 @@ static inline int task_on_rq_queued(struct task_struct *p)
 	return p->on_rq == TASK_ON_RQ_QUEUED;
 }
 
+/* Membership is insufficient for demand, placement and runnable statistics. */
+static inline bool task_on_rq_runnable(struct task_struct *p)
+{
+	return task_on_rq_queued(p) && !task_sched_delayed(p);
+}
+
 static inline int task_on_rq_migrating(struct task_struct *p)
 {
 	return READ_ONCE(p->on_rq) == TASK_ON_RQ_MIGRATING;
@@ -1857,6 +1869,8 @@ extern const u32		sched_prio_to_wmult[40];
 #define DEQUEUE_SAVE		0x02 /* Matches ENQUEUE_RESTORE */
 #define DEQUEUE_MOVE		0x04 /* Matches ENQUEUE_MOVE */
 #define DEQUEUE_NOCLOCK		0x08 /* Matches ENQUEUE_NOCLOCK */
+#define DEQUEUE_DELAYED		0x80 /* finish an already-accounted sleep */
+#define DEQUEUE_SPECIAL		0x100 /* no delayed dequeue for special states */
 
 #define ENQUEUE_WAKEUP		0x01
 #define ENQUEUE_RESTORE		0x02
@@ -1865,6 +1879,7 @@ extern const u32		sched_prio_to_wmult[40];
 
 #define ENQUEUE_HEAD		0x10
 #define ENQUEUE_REPLENISH	0x20
+#define ENQUEUE_DELAYED		0x80 /* wake a retained fair sleeper */
 #ifdef CONFIG_SMP
 #define ENQUEUE_MIGRATED	0x40
 #else
@@ -2155,6 +2170,8 @@ static inline void sub_nr_running(struct rq *rq, unsigned count)
 
 extern void activate_task(struct rq *rq, struct task_struct *p, int flags);
 extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+extern void finish_delayed_task(struct rq *rq, struct task_struct *p);
+extern void finish_delayed_tasks(struct rq *rq);
 
 extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
 
@@ -3208,8 +3225,9 @@ static inline void clear_reserved(int cpu)
 static inline bool
 task_in_cum_window_demand(struct rq *rq, struct task_struct *p)
 {
-	return cpu_of(rq) == task_cpu(p) && (p->on_rq ||
-		p->wts.last_sleep_ts >= rq->wrq.window_start);
+	return cpu_of(rq) == task_cpu(p) &&
+		((p->on_rq && !task_sched_delayed(p)) ||
+		 p->wts.last_sleep_ts >= rq->wrq.window_start);
 }
 
 static inline void walt_fixup_cum_window_demand(struct rq *rq, s64 scaled_delta)
