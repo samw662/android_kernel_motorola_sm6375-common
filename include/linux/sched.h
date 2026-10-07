@@ -1480,10 +1480,13 @@ struct task_struct {
 
 	/* Fair sleeper retained for EEVDF accounting, never executable. */
 	ANDROID_KABI_USE(1, u64 sched_delayed);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
-	ANDROID_KABI_RESERVE(5);
+	/* Physical request suggestion; zero selects the default fair policy. */
+	ANDROID_KABI_USE(2, u64 sched_request);
+	/* Physical slice extrema for this entity's EEVDF tree subtree. */
+	ANDROID_KABI_USE(3, u64 sched_min_slice);
+	ANDROID_KABI_USE(4, u64 sched_max_slice);
+	/* Nomination kind, valid only while this rq's next buddy is this task. */
+	ANDROID_KABI_USE(5, u64 sched_short_buddy);
 #ifdef CONFIG_SYSVIPC
 	/* Keep the SYSVIPC fields in the existing task_struct ABI padding. */
 	ANDROID_KABI_USE(6, struct sysv_sem sysvsem);

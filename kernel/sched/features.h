@@ -103,3 +103,9 @@ SCHED_FEAT(RUN_TO_PARITY, true)
 SCHED_FEAT(DELAY_DEQUEUE, true)
 /* Retained sleepers must not acquire positive service credit. */
 SCHED_FEAT(DELAY_ZERO, true)
+
+/* Append new flags to preserve the indices of existing vendor features. */
+/* Eligible shorter requests may cancel the running entity's protection. */
+SCHED_FEAT(PREEMPT_SHORT, true)
+/* Honor short-request nominations while still enforcing eligibility. */
+SCHED_FEAT(PICK_BUDDY, true)

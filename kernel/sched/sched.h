@@ -2559,9 +2559,17 @@ extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
 extern u64 entity_virtual_deadline(struct sched_entity *se);
 extern void init_task_fair_request(struct task_struct *p);
+extern void __setparam_fair(struct task_struct *p, const struct sched_attr *attr);
 
 /* Initial upstream EEVDF request duration, in physical nanoseconds. */
 #define SCHED_BASE_SLICE	750000ULL
+
+static inline u64 task_fair_slice(const struct task_struct *p)
+{
+	u64 request = READ_ONCE(p->sched_request);
+
+	return request ? request : SCHED_BASE_SLICE;
+}
 
 static inline void init_entity_eevdf(struct sched_entity *se)
 {

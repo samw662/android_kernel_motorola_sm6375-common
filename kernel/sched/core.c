@@ -3046,6 +3046,10 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;
 	init_entity_eevdf(&p->se);
+	/* Inherit request policy, never tree metadata or an rq nomination. */
+	p->se.slice = task_fair_slice(p);
+	p->sched_min_slice = p->sched_max_slice = p->se.slice;
+	p->sched_short_buddy = 0;
 #ifdef CONFIG_SCHED_WALT
 	p->wts.last_sleep_ts		= 0;
 	p->wts.wake_up_idle		= false;
@@ -3227,6 +3231,9 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
+		p->sched_request = 0;
+		p->se.slice = SCHED_BASE_SLICE;
+		p->sched_min_slice = p->sched_max_slice = p->se.slice;
 		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
 			p->policy = SCHED_NORMAL;
 			p->static_prio = NICE_TO_PRIO(0);
@@ -5142,7 +5149,7 @@ static void __setscheduler_params(struct task_struct *p,
 	if (dl_policy(policy))
 		__setparam_dl(p, attr);
 	else if (fair_policy(policy))
-		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+		__setparam_fair(p, attr);
 
 	/*
 	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
@@ -5334,7 +5341,9 @@ recheck:
 	 * but store a possible modification of reset_on_fork.
 	 */
 	if (unlikely(policy == p->policy)) {
-		if (fair_policy(policy) && attr->sched_nice != task_nice(p))
+		if (fair_policy(policy) &&
+		    (attr->sched_nice != task_nice(p) ||
+		     attr->sched_runtime != p->sched_request))
 			goto change;
 		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
 			goto change;
@@ -5485,6 +5494,8 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 		.sched_policy   = policy,
 		.sched_priority = param->sched_priority,
 		.sched_nice	= PRIO_TO_NICE(p->static_prio),
+		/* Legacy priority/policy changes preserve the fair suggestion. */
+		.sched_runtime	= READ_ONCE(p->sched_request),
 	};
 
 	/* Fixup the legacy SCHED_RESET_ON_FORK hack. */
@@ -5872,8 +5883,10 @@ SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
 		__getparam_dl(p, &kattr);
 	else if (task_has_rt_policy(p))
 		kattr.sched_priority = p->rt_priority;
-	else
+	else {
 		kattr.sched_nice = task_nice(p);
+		kattr.sched_runtime = READ_ONCE(p->se.slice);
+	}
 
 #ifdef CONFIG_UCLAMP_TASK
 	kattr.sched_util_min = p->uclamp_req[UCLAMP_MIN].value;

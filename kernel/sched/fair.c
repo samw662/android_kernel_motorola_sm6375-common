@@ -742,24 +742,65 @@ static inline void __update_min_deadline(struct sched_entity *se,
 		/* Virtual timestamps use signed differences across u64 wrap. */
 		if ((s64)(se->min_deadline - child->min_deadline) > 0)
 			se->min_deadline = child->min_deadline;
+		task_of(se)->sched_min_slice = min(task_of(se)->sched_min_slice,
+						task_of(child)->sched_min_slice);
+		task_of(se)->sched_max_slice = max(task_of(se)->sched_max_slice,
+						task_of(child)->sched_max_slice);
 	}
 }
 
-/* min_deadline = min(deadline, left->min_deadline, right->min_deadline). */
+/* Deadline is virtual; slice extrema are physical nanoseconds. */
 static inline bool min_deadline_update(struct sched_entity *se, bool exit)
 {
 	u64 old_min_deadline = se->min_deadline;
+	struct task_struct *p = task_of(se);
+	u64 old_min_slice = p->sched_min_slice;
+	u64 old_max_slice = p->sched_max_slice;
 	struct rb_node *node = &se->run_node;
 
 	se->min_deadline = se->deadline;
+	p->sched_min_slice = p->sched_max_slice = se->slice;
 	__update_min_deadline(se, node->rb_right);
 	__update_min_deadline(se, node->rb_left);
 
-	return exit && se->min_deadline == old_min_deadline;
+	return exit && se->min_deadline == old_min_deadline &&
+	       p->sched_min_slice == old_min_slice &&
+	       p->sched_max_slice == old_max_slice;
 }
 
-RB_DECLARE_CALLBACKS(static, min_deadline_cb, struct sched_entity,
-		     run_node, min_deadline, min_deadline_update);
+/* 51b0e68cfa0a: scalar RB_DECLARE_CALLBACKS cannot copy multiple fields. */
+static void min_deadline_propagate(struct rb_node *node, struct rb_node *stop)
+{
+	while (node != stop) {
+		struct sched_entity *se = rb_entry(node, struct sched_entity, run_node);
+
+		if (min_deadline_update(se, true))
+			break;
+		node = rb_parent(node);
+	}
+}
+
+static void min_deadline_copy(struct rb_node *old, struct rb_node *new)
+{
+	struct sched_entity *ose = rb_entry(old, struct sched_entity, run_node);
+	struct sched_entity *nse = rb_entry(new, struct sched_entity, run_node);
+
+	nse->min_deadline = ose->min_deadline;
+	task_of(nse)->sched_min_slice = task_of(ose)->sched_min_slice;
+	task_of(nse)->sched_max_slice = task_of(ose)->sched_max_slice;
+}
+
+static void min_deadline_rotate(struct rb_node *old, struct rb_node *new)
+{
+	min_deadline_copy(old, new);
+	min_deadline_update(rb_entry(old, struct sched_entity, run_node), false);
+}
+
+static const struct rb_augment_callbacks min_deadline_cb = {
+	.propagate = min_deadline_propagate,
+	.copy = min_deadline_copy,
+	.rotate = min_deadline_rotate,
+};
 
 /*
  * Enqueue an entity into the rb-tree, still ordered by vruntime:
@@ -773,6 +814,8 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 	avg_vruntime_add(cfs_rq, se);
 	se->min_deadline = se->deadline;
+	/* 9a8bc9bb4c3f: initialize all leaf aggregates before propagation. */
+	task_of(se)->sched_min_slice = task_of(se)->sched_max_slice = se->slice;
 
 	/*
 	 * Find the right place in the rbtree:
@@ -1015,17 +1058,75 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 
 static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
 
+/* Extrema cover EEVDF membership, including retained delayed entities. */
+static u64 cfs_rq_min_slice(struct cfs_rq *cfs_rq)
+{
+	struct rb_node *root = cfs_rq->tasks_timeline.rb_root.rb_node;
+	struct sched_entity *curr = cfs_rq->curr;
+	u64 slice = U64_MAX;
+
+	if (curr && curr->on_rq)
+		slice = curr->slice;
+	if (root)
+		slice = min(slice, task_of(rb_entry(root, struct sched_entity,
+						   run_node))->sched_min_slice);
+	return slice;
+}
+
+static u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq)
+{
+	struct rb_node *root = cfs_rq->tasks_timeline.rb_root.rb_node;
+	struct sched_entity *curr = cfs_rq->curr;
+	u64 slice = 0;
+
+	if (curr && curr->on_rq)
+		slice = curr->slice;
+	if (root)
+		slice = max(slice, task_of(rb_entry(root, struct sched_entity,
+						   run_node))->sched_max_slice);
+	return slice;
+}
+
+/*
+ * With current outside the tree, it becomes ineligible at
+ * O + floor(A_tree / W_tree) + 1. Do not add current to this quotient:
+ * v > (A_tree + w*v) / (W_tree + w) iff v > A_tree / W_tree.
+ */
+static u64 ineligible_vruntime(struct cfs_rq *cfs_rq)
+{
+	s64 runtime = cfs_rq->avg_vruntime;
+	s64 weight = cfs_rq->avg_load;
+	s64 delta;
+
+	/* One entity has no finite ineligibility boundary; D still limits Q. */
+	if (!weight)
+		return cfs_rq->curr->deadline;
+	delta = div64_s64(runtime, weight);
+	if (runtime < 0 && runtime - delta * weight)
+		delta--;
+	return cfs_rq->zero_vruntime + delta + 1;
+}
+
+static u64 protection_boundary(struct cfs_rq *cfs_rq,
+			       struct sched_entity *se, u64 vruntime)
+{
+	u64 slice = sched_feat(RUN_TO_PARITY) ?
+		cfs_rq_min_slice(cfs_rq) : SCHED_BASE_SLICE;
+	u64 boundary;
+
+	slice = min(slice, se->slice);
+	/* Also cap when current owns the minimum but D was preserved on shrink. */
+	boundary = min_vruntime(se->deadline,
+			       vruntime + calc_delta_fair(slice, se));
+	if (sched_feat(PREEMPT_SHORT) && slice < se->slice)
+		boundary = min_vruntime(boundary, ineligible_vruntime(cfs_rq));
+	return boundary;
+}
+
 static void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	u64 slice = se->slice;
-
-	/* Uniform 750us requests need neither min_slice nor variable slices. */
-	if (!sched_feat(RUN_TO_PARITY))
-		slice = min_t(u64, slice, SCHED_BASE_SLICE);
 	cfs_rq->protected_entity = se;
-	/* Preserved relative deadlines may exceed one physical request. */
-	cfs_rq->vprot = min_vruntime(se->deadline,
-			se->vruntime + calc_delta_fair(slice, se));
+	cfs_rq->vprot = protection_boundary(cfs_rq, se, se->vruntime);
 }
 
 static void update_protect_slice(struct cfs_rq *cfs_rq)
@@ -1033,14 +1134,14 @@ static void update_protect_slice(struct cfs_rq *cfs_rq)
 	struct sched_entity *curr = cfs_rq->curr;
 	u64 vruntime, vprot;
 
-	if (!sched_feat(RUN_TO_PARITY) || !curr || !curr->on_rq ||
+	if (!curr || !curr->on_rq ||
 	    cfs_rq->protected_entity != curr)
 		return;
 
 	/* A join can move V backwards, including a BATCH/IDLE wakeup. */
 	vruntime = min_vruntime(curr->vruntime, avg_vruntime(cfs_rq));
 	vprot = min_vruntime(cfs_rq->vprot,
-			vruntime + calc_delta_fair(SCHED_BASE_SLICE, curr));
+			protection_boundary(cfs_rq, curr, vruntime));
 	if (vprot == cfs_rq->vprot)
 		return;
 	cfs_rq->vprot = vprot;
@@ -1060,6 +1161,20 @@ u64 entity_virtual_deadline(struct sched_entity *se)
 	return se->vruntime + calc_delta_fair(se->slice, se);
 }
 
+/* rq and pi locks held, with the entity removed by the parameter change. */
+void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
+{
+	u64 request = 0;
+
+	p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+	if (attr->sched_runtime)
+		request = clamp_t(u64, attr->sched_runtime,
+				  NSEC_PER_MSEC / 10, NSEC_PER_MSEC * 100);
+	WRITE_ONCE(p->sched_request, request);
+	p->se.slice = task_fair_slice(p);
+	/* Preserve outstanding D and Q; restore updates the protection cap. */
+}
+
 /* An unpublished child or a task entering fair starts a new fair lifetime. */
 void init_task_fair_request(struct task_struct *p)
 {
@@ -1069,9 +1184,11 @@ void init_task_fair_request(struct task_struct *p)
 	SCHED_WARN_ON(task_sched_delayed(p));
 	WRITE_ONCE(p->sched_delayed, 0);
 	se->vlag = 0;
-	se->slice = SCHED_BASE_SLICE;
+	se->slice = task_fair_slice(p);
 	se->deadline = entity_virtual_deadline(se);
 	se->min_deadline = se->deadline;
+	p->sched_min_slice = p->sched_max_slice = se->slice;
+	p->sched_short_buddy = 0;
 }
 
 /* Service and deadline are virtual timestamps, not physical nanoseconds. */
@@ -1086,7 +1203,7 @@ static bool renew_entity_request(struct sched_entity *se)
 	if (!entity_request_expired(se))
 		return false;
 
-	se->slice = SCHED_BASE_SLICE;
+	se->slice = task_fair_slice(task_of(se));
 	se->deadline = entity_virtual_deadline(se);
 	se->min_deadline = se->deadline;
 	return true;
@@ -1119,24 +1236,27 @@ static bool update_curr_request(struct cfs_rq *cfs_rq)
 
 /*
  * Save virtual lag while the entity still belongs to the runnable set.
- * Join/leave operations can move V discontinuously. All requests in this
- * model have the same physical duration, so r_max is SCHED_BASE_SLICE.
+ * Join/leave operations can move V discontinuously. r_max is the largest
+ * physical request among members, including retained delayed entities.
  * Allow one request plus tick quantization, then convert with this entity's
  * weight. This bounds sleep snapshots, not administrative service debt.
  */
-static s64 entity_lag(u64 avruntime, struct sched_entity *se)
+static s64 entity_lag(struct cfs_rq *cfs_rq, u64 avruntime,
+		      struct sched_entity *se)
 {
 	s64 lag, limit;
 
 	lag = (s64)(avruntime - se->vruntime);
-	limit = calc_delta_fair(SCHED_BASE_SLICE + TICK_NSEC, se);
+	/* SAVE may temporarily exclude se; retain its request in the bound. */
+	limit = calc_delta_fair(max(cfs_rq_max_slice(cfs_rq), se->slice) +
+			       TICK_NSEC, se);
 	return clamp(lag, -limit, limit);
 }
 
 static bool update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	u64 avruntime = avg_vruntime(cfs_rq);
-	s64 lag = entity_lag(avruntime, se);
+	s64 lag = entity_lag(cfs_rq, avruntime, se);
 
 	SCHED_WARN_ON(!se->on_rq);
 	if (entity_sched_delayed(se)) {
@@ -3453,7 +3573,7 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			} else {
 				s64 deadline = (s64)(se->deadline - avruntime);
 
-				lag = entity_lag(avruntime, se);
+				lag = entity_lag(cfs_rq, avruntime, se);
 				se->vruntime = avruntime -
 					reweight_virtual_time(lag, old_weight, weight);
 				se->deadline = avruntime +
@@ -4707,7 +4827,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * SAVE/RESTORE retain the remaining virtual service, including expiry.
 	 */
 	if (flags & ENQUEUE_WAKEUP) {
-		se->slice = SCHED_BASE_SLICE;
+		se->slice = task_fair_slice(task_of(se));
 		se->deadline = entity_virtual_deadline(se);
 	} else {
 		se->deadline = se->vruntime + remaining;
@@ -4835,6 +4955,7 @@ static void __clear_buddies_last(struct sched_entity *se)
 
 static void __clear_buddies_next(struct sched_entity *se)
 {
+	task_of(se)->sched_short_buddy = 0;
 	for_each_sched_entity(se) {
 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
 		if (cfs_rq->next != se)
@@ -5087,12 +5208,17 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	struct sched_entity *se = pick_eevdf(cfs_rq);
 	struct sched_entity *next = cfs_rq->next;
 
-	/* A cache-locality hint may break a deadline tie, never eligibility. */
-	if (!(se == running_entity(cfs_rq) && protect_slice(cfs_rq, se)) &&
-	    sched_feat(NEXT_BUDDY) && next && next->on_rq &&
+	/* Recheck short nominations at dispatch; retained entities never run. */
+	if (next && next->on_rq &&
 	    !entity_sched_delayed(next) &&
-	    entity_eligible(cfs_rq, next) && next->deadline == se->deadline)
-		se = next;
+	    entity_eligible(cfs_rq, next) &&
+	    !(se && se == running_entity(cfs_rq) && protect_slice(cfs_rq, se))) {
+		if ((sched_feat(PICK_BUDDY) && sched_feat(PREEMPT_SHORT) &&
+		     task_of(next)->sched_short_buddy) ||
+		    (sched_feat(NEXT_BUDDY) && se &&
+		     next->deadline == se->deadline))
+			se = next;
+	}
 
 	clear_buddies(cfs_rq, se);
 	return se;
@@ -6201,7 +6327,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		account_entity_dequeue(cfs_rq, se);
 		if (move)
 			place_entity(cfs_rq, se, 0);
-		se->slice = SCHED_BASE_SLICE;
+		se->slice = task_fair_slice(p);
 		se->deadline = entity_virtual_deadline(se);
 		WRITE_ONCE(p->sched_delayed, 0);
 		account_entity_enqueue(cfs_rq, se);
@@ -8374,10 +8500,32 @@ static void set_next_buddy(struct sched_entity *se)
 		return;
 
 	for_each_sched_entity(se) {
+		struct sched_entity *next = cfs_rq_of(se)->next;
+
 		if (SCHED_WARN_ON(!se->on_rq))
 			return;
+		/* Ordinary locality hints cannot overwrite a short nomination. */
+		if (next && task_of(next)->sched_short_buddy)
+			return;
+		task_of(se)->sched_short_buddy = 0;
 		cfs_rq_of(se)->next = se;
 	}
+}
+
+static void set_short_buddy(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct sched_entity *next = cfs_rq->next;
+
+	/* d2e010082757: shortest request, then earliest deadline on a tie. */
+	if (next && task_of(next)->sched_short_buddy && next->on_rq &&
+	    !entity_sched_delayed(next) && entity_eligible(cfs_rq, next) &&
+	    (next->slice < se->slice ||
+	     (next->slice == se->slice && deadline_before(next->deadline, se->deadline))))
+		return;
+	if (next)
+		task_of(next)->sched_short_buddy = 0;
+	task_of(se)->sched_short_buddy = 1;
+	cfs_rq->next = se;
 }
 
 static void __maybe_unused set_skip_buddy(struct sched_entity *se)
@@ -8427,6 +8575,21 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		cancel_protect_slice(cfs_rq, se);
 	/* Enqueue may have armed the timer before the protection update. */
 	hrtick_update(rq);
+
+	/*
+	 * A shorter eligible normal wakee may forfeit current's protection.
+	 * Do this even with resched pending, so simultaneous short wakeups keep
+	 * the shortest nomination. No vruntime, lag or deadline is changed.
+	 */
+	if (p->policy == SCHED_NORMAL && sched_feat(WAKEUP_PREEMPTION) &&
+	    sched_feat(PREEMPT_SHORT) && pse->slice < se->slice &&
+	    entity_eligible(cfs_rq, pse)) {
+		cancel_protect_slice(cfs_rq, se);
+		set_short_buddy(cfs_rq, pse);
+		resched_curr(rq);
+		hrtick_update(rq);
+		return;
+	}
 
 	/*
 	 * We can come here with TIF_NEED_RESCHED already set from new task
