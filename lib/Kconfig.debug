@@ -1036,6 +1036,20 @@ config SCHED_DEBUG
 	  that can help debug the scheduler. The runtime overhead of this
 	  option is minimal.
 
+config WEARYSTARS_EEVDF_DEBUG
+	bool "WearyStars EEVDF read-only monitor"
+	depends on DEBUG_KERNEL && DEBUG_FS && SMP && 64BIT
+	depends on !FAIR_GROUP_SCHED
+	default n
+	help
+	  Provide root-readable EEVDF snapshots and per-CPU event counters at
+	  /sys/kernel/debug/wearystars/eevdf/{status,counters}. No scheduler
+	  parameters can be modified through this interface. Snapshots read
+	  existing accounting without updating the scheduler clocks or loads.
+	  When enabled, event hooks add local per-CPU increments. Reading status
+	  briefly locks each online runqueue; reading counters sends short IPIs.
+	  Leave disabled for normal production use.
+
 config SCHED_INFO
 	bool
 	default n

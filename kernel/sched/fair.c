@@ -24,6 +24,7 @@
 #include <linux/rbtree_augmented.h>
 
 #include "sched.h"
+#include "eevdf_monitor.h"
 
 /* The retained-sleeper accounting below is deliberately flat-rq only. */
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -997,12 +998,15 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = running_entity(cfs_rq);
 
+	weary_eevdf_count(WEARY_EEVDF_PICK);
 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
 		curr = NULL;
 
 	/* Protection never makes an ineligible entity a scheduling candidate. */
-	if (curr && protect_slice(cfs_rq, curr))
+	if (curr && protect_slice(cfs_rq, curr)) {
+		weary_eevdf_count(WEARY_EEVDF_PROTECTED);
 		return curr;
+	}
 
 	return pick_eevdf_tree(cfs_rq, curr);
 }
@@ -1086,6 +1090,82 @@ static u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq)
 						   run_node))->sched_max_slice);
 	return slice;
 }
+
+#ifdef CONFIG_WEARYSTARS_EEVDF_DEBUG
+/* Read only: rq->lock protects membership and all EEVDF value sources. */
+void weary_eevdf_snapshot(struct rq *rq, struct weary_eevdf_snapshot *s)
+{
+	struct cfs_rq *cfs = &rq->cfs;
+	struct sched_entity *se = cfs->curr;
+	struct sched_entity *owner = cfs->protected_entity;
+	struct rb_node *root = cfs->tasks_timeline.rb_root.rb_node;
+	struct task_struct *p = rq->curr;
+
+	lockdep_assert_held(&rq->lock);
+	s->clock = rq->clock;
+	s->current_pid = READ_ONCE(p->pid);
+	/* Never wait for alloc_lock while holding the runqueue lock. */
+	if (spin_trylock(&p->alloc_lock)) {
+		memcpy(s->comm, p->comm, TASK_COMM_LEN);
+		s->comm[TASK_COMM_LEN - 1] = '\0';
+		s->comm_valid = true;
+		spin_unlock(&p->alloc_lock);
+	}
+	s->nr_running = rq->nr_running;
+	s->queued = cfs->nr_running;
+	s->runnable = cfs->h_nr_running;
+	s->delayed = cfs->nr_running - cfs->h_nr_running;
+	s->min_vruntime = cfs->min_vruntime;
+	s->zero_vruntime = cfs->zero_vruntime;
+	s->V = avg_vruntime(cfs);
+	s->avg_vruntime = cfs->avg_vruntime;
+	s->avg_load = cfs->avg_load;
+	s->load_weight = cfs->load.weight;
+	s->pelt_load = cfs->avg.load_avg;
+	s->pelt_runnable = cfs->avg.runnable_load_avg;
+	s->pelt_util = cfs->avg.util_avg;
+	/* One mask read; feature control is independent of the rq lock. */
+	s->features = READ_ONCE(sysctl_sched_features);
+	if (se) {
+		s->fair_valid = true;
+		s->fair_pid = READ_ONCE(task_of(se)->pid);
+		s->on_rq = se->on_rq;
+		s->entity_delayed = entity_sched_delayed(se);
+		s->eligible = entity_eligible(cfs, se);
+		s->vruntime = se->vruntime;
+		s->deadline = se->deadline;
+		s->slice = se->slice;
+		s->weight = se->load.weight;
+		s->D = (s64)(se->deadline - se->vruntime);
+	}
+	if (owner) {
+		s->protected_valid = true;
+		s->protected_pid = READ_ONCE(task_of(owner)->pid);
+		s->vprot = cfs->vprot;
+		s->Q = (s64)(cfs->vprot - owner->vruntime);
+		s->protection_active = owner == running_entity(cfs) &&
+			owner->on_rq && !entity_sched_delayed(owner) &&
+			entity_eligible(cfs, owner) && protect_slice(cfs, owner);
+	}
+	if (root || (se && se->on_rq)) {
+		s->timeline_valid = true;
+		s->min_slice = cfs_rq_min_slice(cfs);
+		s->max_slice = cfs_rq_max_slice(cfs);
+		if (root)
+			s->min_deadline = rb_entry(root, struct sched_entity,
+						   run_node)->min_deadline;
+		if (se && se->on_rq)
+			s->min_deadline = root ?
+				min_vruntime(s->min_deadline, se->deadline) : se->deadline;
+	}
+#ifdef CONFIG_SCHED_WALT
+	s->walt_demand = rq->wrq.walt_stats.cumulative_runnable_avg_scaled;
+	s->walt_predicted = rq->wrq.walt_stats.pred_demands_sum_scaled;
+	s->rtg_high_prio = rq->wrq.walt_stats.nr_rtg_high_prio_tasks;
+	s->big_tasks = rq->wrq.walt_stats.nr_big_tasks;
+#endif
+}
+#endif
 
 /*
  * With current outside the tree, it becomes ineligible at
@@ -1206,6 +1286,7 @@ static bool renew_entity_request(struct sched_entity *se)
 	se->slice = task_fair_slice(task_of(se));
 	se->deadline = entity_virtual_deadline(se);
 	se->min_deadline = se->deadline;
+	weary_eevdf_count(WEARY_EEVDF_RENEW);
 	return true;
 }
 
@@ -5034,8 +5115,10 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	if (!(flags & DEQUEUE_SAVE) || (flags & DEQUEUE_SLEEP))
 		forget_protect_slice(cfs_rq, se);
 	account_entity_dequeue(cfs_rq, se);
-	if (flags & DEQUEUE_DELAYED)
+	if (flags & DEQUEUE_DELAYED) {
 		WRITE_ONCE(task_of(se)->sched_delayed, 0);
+		weary_eevdf_count(WEARY_EEVDF_DELAYED_COMPLETE);
+	}
 
 	/* return excess runtime on last dequeue */
 	return_cfs_rq_runtime(cfs_rq);
@@ -6349,6 +6432,8 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 			cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
 		update_overutilized_status(rq);
 		hrtick_update(rq);
+		weary_eevdf_count(WEARY_EEVDF_RETAINED_WAKE);
+		weary_eevdf_count(WEARY_EEVDF_DELAYED_ENQUEUE);
 		return;
 	}
 
@@ -6452,6 +6537,8 @@ enqueue_throttle:
 	assert_list_leaf_cfs_rq(rq);
 
 	hrtick_update(rq);
+	if (delayed)
+		weary_eevdf_count(WEARY_EEVDF_DELAYED_ENQUEUE);
 }
 
 static void set_next_buddy(struct sched_entity *se);
@@ -6486,6 +6573,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 			list_del_init(&se->group_node);
 #endif
 			WRITE_ONCE(p->sched_delayed, 1);
+			weary_eevdf_count(WEARY_EEVDF_DELAYED_ENTER);
 #ifdef CONFIG_SCHED_WALT
 			/* A retained wake can precede the eventual context switch. */
 			p->wts.last_sleep_ts = sched_ktime_clock();
@@ -8388,6 +8476,7 @@ static void detach_entity_cfs_rq(struct sched_entity *se);
  */
 static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
+	weary_eevdf_count(WEARY_EEVDF_MIGRATE);
 	/* Saved virtual lag is rq-independent; enqueue places it on new_cpu. */
 	if (p->on_rq == TASK_ON_RQ_MIGRATING) {
 		/*
@@ -8526,6 +8615,7 @@ static void set_short_buddy(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		task_of(next)->sched_short_buddy = 0;
 	task_of(se)->sched_short_buddy = 1;
 	cfs_rq->next = se;
+	weary_eevdf_count(WEARY_EEVDF_SHORT);
 }
 
 static void __maybe_unused set_skip_buddy(struct sched_entity *se)
@@ -8834,6 +8924,7 @@ static void yield_task_fair(struct rq *rq)
 	struct sched_entity *se = &curr->se;
 	u64 deadline = se->deadline;
 
+	weary_eevdf_count(WEARY_EEVDF_YIELD);
 	cancel_protect_slice(cfs_rq, se);
 
 	/*
