@@ -530,7 +530,7 @@ struct sched_entity {
 	ANDROID_KABI_USE(1, s64 vlag);	/* virtual lag */
 	ANDROID_KABI_USE(2, u64 slice);	/* request duration in nanoseconds */
 	ANDROID_KABI_USE(3, u64 deadline);	/* virtual deadline */
-	ANDROID_KABI_USE(4, u64 min_deadline); /* subtree minimum virtual deadline */
+	ANDROID_KABI_USE(4, u64 min_vruntime); /* subtree minimum virtual runtime */
 };
 
 struct cpu_cycle_counter_cb {

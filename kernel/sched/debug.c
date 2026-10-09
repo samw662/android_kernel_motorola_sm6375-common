@@ -501,11 +501,10 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 
 void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 {
-	s64 MIN_vruntime = -1, min_vruntime, max_vruntime = -1,
-		spread, rq0_min_vruntime, spread0;
+	s64 MIN_vruntime = -1, min_vruntime, rq0_min_vruntime, spread0;
 	u64 zero_vruntime, avruntime;
 	struct rq *rq = cpu_rq(cpu);
-	struct sched_entity *last;
+	struct rb_node *root;
 	unsigned long flags;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -519,11 +518,10 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 			SPLIT_NS(cfs_rq->exec_clock));
 
 	raw_spin_lock_irqsave(&rq->lock, flags);
-	if (rb_first_cached(&cfs_rq->tasks_timeline))
-		MIN_vruntime = (__pick_first_entity(cfs_rq))->vruntime;
-	last = __pick_last_entity(cfs_rq);
-	if (last)
-		max_vruntime = last->vruntime;
+	root = cfs_rq->tasks_timeline.rb_root.rb_node;
+	if (root)
+		MIN_vruntime = rb_entry(root, struct sched_entity,
+					run_node)->min_vruntime;
 	min_vruntime = cfs_rq->min_vruntime;
 	zero_vruntime = cfs_rq->zero_vruntime;
 	avruntime = avg_vruntime(cfs_rq);
@@ -537,11 +535,10 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 			SPLIT_NS(zero_vruntime));
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "avg_vruntime",
 			SPLIT_NS(avruntime));
-	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "max_vruntime",
-			SPLIT_NS(max_vruntime));
-	spread = max_vruntime - MIN_vruntime;
-	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "spread",
-			SPLIT_NS(spread));
+	/* Exact maximum needs a tree walk; keep rq-lock sampling constant-time. */
+	SEQ_printf(m, "  .%-30s: unavailable (deadline-ordered tree)\n",
+		   "max_vruntime");
+	SEQ_printf(m, "  .%-30s: unavailable (deadline-ordered tree)\n", "spread");
 	spread0 = min_vruntime - rq0_min_vruntime;
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "spread0",
 			SPLIT_NS(spread0));
