@@ -21,6 +21,7 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include <linux/math64.h>
+#include <linux/overflow.h>
 #include <linux/rbtree_augmented.h>
 
 #include "sched.h"
@@ -679,6 +680,7 @@ static bool vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 	struct sched_entity *curr = cfs_rq->curr;
 	s64 avg = cfs_rq->avg_vruntime;
 	s64 load = cfs_rq->avg_load;
+	s64 key, rhs;
 
 	if (curr && curr->on_rq) {
 		unsigned long weight = scale_load_down(curr->load.weight);
@@ -687,7 +689,15 @@ static bool vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 		load += weight;
 	}
 
-	return avg >= (s64)(vruntime - cfs_rq->zero_vruntime) * load;
+	key = (s64)(vruntime - cfs_rq->zero_vruntime);
+	/*
+	 * With nonnegative load, an overflowing product is outside the range
+	 * of avg: negative keys are eligible, positive keys are not.
+	 */
+	if (check_mul_overflow(key, load, &rhs))
+		return key < 0;
+
+	return avg >= rhs;
 }
 
 int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
