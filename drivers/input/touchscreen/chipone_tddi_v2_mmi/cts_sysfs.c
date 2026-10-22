@@ -3136,24 +3136,30 @@ static ssize_t gesture_store(struct device *dev,
                                              const char *buf, size_t count)
 {
         unsigned int value = 0;
-        int err = 0;
         struct chipone_ts_data *cts_data = dev_get_drvdata(dev);
 
-        cts_lock_device(&cts_data->cts_dev);
-        err = sscanf(buf, "%d", &value);
-        if (err < 0) {
+        /* accepts plain 0/1 and the legacy Motorola codes (base 0: 0x31 etc.) */
+        if (kstrtouint(buf, 0, &value)) {
                 cts_err("error: Failed to convert value");
                 return -EINVAL;
         }
 
+        cts_info("gesture write: 0x%x", value);
+
+        cts_lock_device(&cts_data->cts_dev);
         switch (value) {
                 case 1:
+                case 0x31:      /* double tap enable */
                         cts_data->s_tap_flag = 0;
                         cts_data->d_tap_flag = 1;
                         break;
-                default:
+                case 0:
+                case 0x30:      /* double tap disable */
                         cts_data->s_tap_flag = 0;
                         cts_data->d_tap_flag = 0;
+                        break;
+                default:
+                        /* zero/single tap codes etc.: don't clobber dt2w state */
                         break;
         }
         cts_unlock_device(&cts_data->cts_dev);

@@ -4024,34 +4024,38 @@ static ssize_t gesture_show(struct device *dev,
 static ssize_t gesture_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
-	int value;
-	int err = 0;
+	unsigned int value;
 
-	err = sscanf(buf, "%d", &value);
-	if (err < 0) {
+	/* accepts plain 0/1 and the legacy Motorola codes (base 0: 0x31 etc.) */
+	if (kstrtouint(buf, 0, &value)) {
 		ILI_INFO("Failed to convert value\n");
 		return -EINVAL;
 	}
 
-	err = count;
+	ILI_INFO("gesture write: 0x%x\n", value);
 
 	switch (value) {
 		case 1:
+		case 0x31:	/* double tap enable */
 			ilits->sys_gesture_type = 1;
 			ilits->ges_sym.single_tap = OFF;
 			ilits->ges_sym.double_tap = DOUBLE_TAP;
 			break;
-		default:
+		case 0:
+		case 0x30:	/* double tap disable */
 			ilits->sys_gesture_type = 0;
 			ilits->ges_sym.single_tap = OFF;
 			ilits->ges_sym.double_tap = OFF;
 			break;
+		default:
+			/* zero/single tap codes etc.: don't clobber dt2w state */
+			return count;
 	}
 
 	ili_gesture_state_switch();
 	ILI_INFO("sys_gesture_type=%d, should_enable_gesture=%d\n", ilits->sys_gesture_type, ilits->should_enable_gesture);
 
-	return err;
+	return count;
 }
 #endif //ILI_DOUBLE_TAP_CTRL
 
